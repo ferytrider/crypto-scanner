@@ -7,10 +7,11 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BASE = "https://api.toobit.com"
+
 TIMEFRAMES = {
-    "1h": 60 * 60 * 1000,
-    "4h": 4 * 60 * 60 * 1000,
-    "1d": 24 * 60 * 60 * 1000
+    "1h": 3600000,
+    "4h": 14400000,
+    "1d": 86400000
 }
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -21,31 +22,40 @@ def get_json(url):
     req = urllib.request.Request(
         url, headers={"User-Agent": "CryptoScanner/1.0"}
     )
-    with urllib.request.urlopen(req, timeout=20) as r:
+    with urllib.request.urlopen(req, timeout=25) as r:
         return json.loads(r.read().decode())
 
 
 def send_telegram(message):
     if not TOKEN or not CHAT_ID:
-        raise RuntimeError("Telegram secrets are missing")
+        raise RuntimeError("Telegram secrets missing")
 
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+
     data = urllib.parse.urlencode({
         "chat_id": CHAT_ID,
         "text": message
     }).encode()
 
     req = urllib.request.Request(url, data=data)
+
     with urllib.request.urlopen(req, timeout=20) as r:
-        return json.loads(r.read().decode())
+        result = json.loads(r.read().decode())
+
+    if not result.get("ok"):
+        raise RuntimeError("Telegram send failed")
 
 
 def get_symbols():
     data = get_json(BASE + "/api/v1/exchangeInfo")
+
+    contracts = data.get("contracts", [])
+
     return [
-        c["symbol"] for c in data["contracts"]
+        c["symbol"] for c in contracts
         if c.get("quoteAsset") == "USDT"
         and c.get("status") == "TRADING"
+        and c.get("inverse") is False
         and c.get("symbol", "").endswith("-SWAP-USDT")
     ]
 
@@ -64,16 +74,18 @@ def check_candle(c):
         return None
 
     if body >= 3 * (upper + lower):
-        return "BULLISH" if close > o else "BEARISH"
+        return "صعودی 🟢" if close > o else "نزولی 🔴"
 
     return None
 
 
-def scan_one(symbol, interval, duration):
+def scan_one(symbol, interval, duration, now):
     params = urllib.parse.urlencode({
         "symbol": symbol,
         "interval": interval,
-        "limit": 10
+        "startTime": now - duration * 5,
+        "endTime": now,
+        "limit": 5
     })
 
     candles = get_json(
@@ -82,8 +94,6 @@ def scan_one(symbol, interval, duration):
 
     if not isinstance(candles, list):
         return None
-
-    now = int(time.time() * 1000)
 
     closed = [
         c for c in candles
@@ -96,30 +106,41 @@ def scan_one(symbol, interval, duration):
     first = check_candle(closed[-2])
     second = check_candle(closed[-1])
 
-    if first and first == second:
+    if first and second:
         return {
             "symbol": symbol,
             "timeframe": interval,
-            "direction": first
+            "first": first,
+            "second": second
         }
 
     return None
 
 
 def main():
+    now = int(
+        get_json(BASE + "/api/v1/time")["serverTime"]
+    )
+
     symbols = get_symbols()
+
+    print("Total USDT futures:", len(symbols))
+
     results = []
+    errors = 0
 
-    print("Symbols found:", len(symbols))
-
-    with ThreadPoolExecutor(max_workers=5) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         tasks = []
 
         for symbol in symbols:
             for interval, duration in TIMEFRAMES.items():
                 tasks.append(
                     pool.submit(
-                        scan_one, symbol, interval, duration
+                        scan_one,
+                        symbol,
+                        interval,
+                        duration,
+                        now
                     )
                 )
 
@@ -129,30 +150,30 @@ def main():
                 if result:
                     results.append(result)
             except Exception as e:
-                print("Scan error:", str(e))
+                errors += 1
+                print("Error:", str(e))
+
+    print("Scan finished:", len(results))
+    print("Errors:", errors)
 
     if not results:
-        send_telegram("Crypto Scanner\n\nNo valid patterns found.")
+        print("No valid patterns found.")
         return
 
-    message = "CRYPTO SCANNER\n\n"
+    message = "CRYPTO SCANNER\n"
+    message += "Two consecutive strong candles\n\n"
 
     for r in results:
-        direction = (
-            "صعودی 🟢"
-            if r["direction"] == "BULLISH"
-            else "نزولی 🔴"
-        )
         message += (
-            f"{r['symbol']}\n"
+            f"Coin: {r['symbol']}\n"
             f"Timeframe: {r['timeframe']}\n"
-            f"Direction: {direction}\n\n"
+            f"Candle 1: {r['first']}\n"
+            f"Candle 2: {r['second']}\n"
+            "--------------------\n"
         )
 
     for i in range(0, len(message), 3500):
         send_telegram(message[i:i + 3500])
-
-    print("Scan completed:", len(results))
 
 
 if __name__ == "__main__":
