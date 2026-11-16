@@ -20,6 +20,11 @@ INTERVAL_MS = {
     "1w": 7 * 24 * 60 * 60 * 1000,
 }
 
+# SHADOW settings
+PIVOT_SIDE = 3
+HIGHER_TF_LIMIT = 200
+
+
 def api_get(path, params=None):
     query = urllib.parse.urlencode(params or {})
     url = BASE + path + ("?" + query if query else "")
@@ -29,9 +34,11 @@ def api_get(path, params=None):
     with urllib.request.urlopen(req, timeout=20) as response:
         return json.loads(response.read().decode("utf-8"))
 
+
 def get_server_time():
     data = api_get("/api/v1/time")
     return int(data["serverTime"])
+
 
 def get_symbols():
     data = api_get("/api/v1/exchangeInfo")
@@ -52,16 +59,25 @@ def get_symbols():
 
     return sorted(set(symbols))
 
+
 def get_closed_candles(symbol, interval, server_time, limit=40):
+    duration = INTERVAL_MS[interval]
+    start_time = server_time - duration * (limit + 2)
+
     data = api_get(
         "/quote/v1/klines",
-        {"symbol": symbol, "interval": interval, "limit": limit}
+        {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": start_time,
+            "endTime": server_time,
+            "limit": limit,
+        }
     )
 
     if isinstance(data, dict):
         data = data.get("data", [])
 
-    duration = INTERVAL_MS[interval]
     candles = []
 
     for row in data:
@@ -76,11 +92,16 @@ def get_closed_candles(symbol, interval, server_time, limit=40):
             "close": float(row[4]),
         }
 
-        # فقط کندل‌هایی که کاملاً بسته شده‌اند
         if candle["time"] + duration <= server_time:
             candles.append(candle)
 
     return sorted(candles, key=lambda x: x["time"])
+
+
+# ==================================
+# STRATEGY 1: SURPRISE
+# Original strategy preserved
+# ==================================
 
 def candle_direction(c):
     if c["close"] > c["open"]:
@@ -89,8 +110,10 @@ def candle_direction(c):
         return "bear"
     return "doji"
 
+
 def body_size(c):
     return abs(c["close"] - c["open"])
+
 
 def is_powerful(candles, index):
     c = candles[index]
@@ -100,7 +123,6 @@ def is_powerful(candles, index):
     lower_wick = min(c["open"], c["close"]) - c["low"]
     wick_sum = max(0, upper_wick) + max(0, lower_wick)
 
-    # حداقل 10 کندل قبل از کندل مورد بررسی لازم است
     previous = candles[max(0, index - 10):index]
     if len(previous) < 10:
         return False
@@ -113,6 +135,7 @@ def is_powerful(candles, index):
         and body >= 2 * average_body
     )
 
+
 def scan_surprise(candles):
     if len(candles) < 13:
         return None
@@ -123,8 +146,8 @@ def scan_surprise(candles):
     if direction not in ("bull", "bear"):
         return None
 
-    # تعداد کندل‌های قدرتمند هم‌رنگ در انتهای داده
     start = last_index
+
     while start >= 0:
         if (
             candle_direction(candles[start]) == direction
@@ -137,7 +160,6 @@ def scan_surprise(candles):
     first_impulse = start + 1
     impulse_count = last_index - first_impulse + 1
 
-    # حداقل دو کندل قدرتمند متوالی
     if impulse_count < 2 or start < 0:
         return None
 
@@ -155,49 +177,143 @@ def scan_surprise(candles):
         "zone_low": opposite["low"],
     }
 
+
+# ==================================
+# STRATEGY 2: SHADOW
+# ==================================
+
+def find_pivots(candles, timeframe):
+    pivots = []
+    side = PIVOT_SIDE
+
+    if len(candles) < side * 2 + 1:
+        return pivots
+
+    duration = INTERVAL_MS[timeframe]
+
+    for i in range(side, len(candles) - side):
+        center = candles[i]
+
+        left = candles[i - side:i]
+        right = candles[i + 1:i + side + 1]
+        neighbors = left + right
+
+        confirmed_at = (
+            candles[i + side]["time"] + duration
+        )
+
+        # Pivot High
+        if all(
+            center["high"] > x["high"]
+            for x in neighbors
+        ):
+            pivots.append({
+                "type": "high",
+                "price": center["high"],
+                "time": center["time"],
+                "confirmed_at": confirmed_at,
+            })
+
+        # Pivot Low
+        if all(
+            center["low"] < x["low"]
+            for x in neighbors
+        ):
+            pivots.append({
+                "type": "low",
+                "price": center["low"],
+                "time": center["time"],
+                "confirmed_at": confirmed_at,
+            })
+
+    return pivots
+
+
 def scan_shadow(candles_1h, references):
     if not candles_1h:
-        return None
+        return []
 
     c = candles_1h[-1]
     results = []
 
-    for timeframe, levels in references.items():
-        high_level = levels["high"]
-        low_level = levels["low"]
+    for timeframe, pivots in references.items():
+        for pivot in pivots:
 
-        # سایه از سقف عبور کرده و کندل زیر سقف بسته شده
-        if c["high"] > high_level and c["close"] < high_level:
-            results.append(f"فروش: سقف {timeframe} = {high_level}")
+            if c["time"] < pivot["confirmed_at"]:
+                continue
 
-        # سایه از کف عبور کرده و کندل بالای کف بسته شده
-        if c["low"] < low_level and c["close"] > low_level:
-            results.append(f"خرید: کف {timeframe} = {low_level}")
+            level = pivot["price"]
 
-    if not results:
-        return None
+            # Sweep above pivot high and close below
+            if (
+                pivot["type"] == "high"
+                and c["high"] > level
+                and c["close"] < level
+            ):
+                results.append({
+                    "direction": "SELL",
+                    "timeframe": timeframe,
+                    "level": level,
+                    "pivot_time": pivot["time"],
+                    "pivot_type": "high",
+                    "candle_time": c["time"],
+                })
 
-    return {
-        "time": c["time"],
-        "details": results,
-    }
+            # Sweep below pivot low and close above
+            elif (
+                pivot["type"] == "low"
+                and c["low"] < level
+                and c["close"] > level
+            ):
+                results.append({
+                    "direction": "BUY",
+                    "timeframe": timeframe,
+                    "level": level,
+                    "pivot_time": pivot["time"],
+                    "pivot_type": "low",
+                    "candle_time": c["time"],
+                })
+
+    return results
+
+
+def shadow_state_key(symbol, event):
+    return (
+        f"{symbol}|SHADOW|{event['timeframe']}|"
+        f"{event['pivot_type']}|{event['pivot_time']}|"
+        f"{event['level']:.12g}"
+    )
+
+
+# ==================================
+# TELEGRAM
+# ==================================
 
 def send_telegram(message):
     if not TOKEN or not CHAT_ID:
-        raise RuntimeError("TELEGRAM_TOKEN یا TELEGRAM_CHAT_ID تنظیم نشده است.")
+        raise RuntimeError(
+            "TELEGRAM_TOKEN یا TELEGRAM_CHAT_ID تنظیم نشده است."
+        )
 
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+
     payload = urllib.parse.urlencode({
         "chat_id": CHAT_ID,
         "text": message,
     }).encode()
 
     req = urllib.request.Request(url, data=payload)
+
     with urllib.request.urlopen(req, timeout=20) as response:
         result = json.loads(response.read().decode("utf-8"))
 
     if not result.get("ok"):
         raise RuntimeError(f"Telegram error: {result}")
+
+
+# ==================================
+# STATE
+# ==================================
 
 def load_state():
     if not STATE_FILE.exists():
@@ -208,35 +324,48 @@ def load_state():
     except Exception:
         return {}, False
 
+
 def save_state(state):
     STATE_FILE.write_text(
         json.dumps(state, ensure_ascii=False, indent=2)
     )
 
+
+# ==================================
+# SYMBOL SCANNER
+# ==================================
+
 def scan_symbol(symbol, server_time):
+    # SURPRISE: 40 closed 1H candles
     candles_1h = get_closed_candles(
         symbol, "1h", server_time, 40
     )
 
     surprise = scan_surprise(candles_1h)
 
+    # SHADOW: higher timeframe pivot history
     references = {}
+
     for timeframe in ("4h", "1d", "1w"):
         candles = get_closed_candles(
-            symbol, timeframe, server_time, 5
+            symbol,
+            timeframe,
+            server_time,
+            HIGHER_TF_LIMIT
         )
-        if candles:
-            last = candles[-1]
-            references[timeframe] = {
-                "high": last["high"],
-                "low": last["low"],
-            }
 
-    shadow = None
-    if len(references) == 3:
-        shadow = scan_shadow(candles_1h, references)
+        references[timeframe] = find_pivots(
+            candles, timeframe
+        )
+
+    shadow = scan_shadow(candles_1h, references)
 
     return symbol, surprise, shadow
+
+
+# ==================================
+# MAIN
+# ==================================
 
 def main():
     server_time = get_server_time()
@@ -245,13 +374,16 @@ def main():
     print(f"Found {len(symbols)} USDT futures contracts.")
 
     state, state_exists = load_state()
+
     new_messages = []
     checked = 0
     errors = 0
 
     with ThreadPoolExecutor(max_workers=8) as executor:
         futures = {
-            executor.submit(scan_symbol, symbol, server_time): symbol
+            executor.submit(
+                scan_symbol, symbol, server_time
+            ): symbol
             for symbol in symbols
         }
 
@@ -262,8 +394,8 @@ def main():
                 symbol, surprise, shadow = future.result()
                 checked += 1
 
+                # SURPRISE: original alert logic
                 surprise_key = f"{symbol}|SURPRISE"
-                shadow_key = f"{symbol}|SHADOW"
 
                 if surprise:
                     event_time = surprise["time"]
@@ -274,6 +406,7 @@ def main():
                             "صعودی" if surprise["direction"] == "bull"
                             else "نزولی"
                         )
+
                         message = (
                             f"🚨 SURPRISE | {symbol}\n"
                             f"جهت: {direction}\n"
@@ -284,33 +417,40 @@ def main():
                             f"تایم‌فریم: 1H\n"
                             f"⏳ بررسی برگشت قیمت با خودت"
                         )
+
                         new_messages.append(message)
 
                     state[surprise_key] = max(
                         old_time, event_time
                     )
 
-                if shadow:
-                    event_time = shadow["time"]
-                    old_time = int(state.get(shadow_key, 0))
+                # SHADOW: one alert per pivot
+                for event in shadow:
+                    key = shadow_state_key(symbol, event)
 
-                    if state_exists and event_time > old_time:
-                        message = (
-                            f"🎯 SHADOW | {symbol}\n"
-                            f"تأیید کندل بسته‌شده 1H:\n"
-                            + "\n".join(shadow["details"])
-                        )
+                    if key in state:
+                        continue
+
+                    message = (
+                        f"🎯 SHADOW | {symbol}\n"
+                        f"جهت: {event['direction']}\n"
+                        f"تایم‌فریم پیوت: {event['timeframe']}\n"
+                        f"قیمت پیوت: {event['level']}\n"
+                        f"نوع پیوت: "
+                        f"{'سقف' if event['direction'] == 'SELL' else 'کف'}\n"
+                        f"تأیید: شکست و برگشت در کندل بسته‌شده 1H"
+                    )
+
+                    if state_exists:
                         new_messages.append(message)
 
-                    state[shadow_key] = max(
-                        old_time, event_time
-                    )
+                    state[key] = event["candle_time"]
 
             except Exception as error:
                 errors += 1
                 print(f"Error on {symbol}: {error}")
 
-    # اولین اجرا فقط وضعیت فعلی را ذخیره می‌کند و پیام قدیمی نمی‌فرستد
+    # Send new alerts
     for message in new_messages:
         send_telegram(message)
         time.sleep(0.2)
@@ -321,6 +461,7 @@ def main():
         f"Finished. Checked: {checked}, "
         f"Errors: {errors}, New alerts: {len(new_messages)}"
     )
+
 
 if __name__ == "__main__":
     main()
