@@ -342,42 +342,156 @@ def aggregate_candles(hourly, target_ms, required_count):
     return result
 
 
+# ==================================================
+# NEW SHADOW PIVOT DETECTION
+# ==================================================
+
 def find_pivots(candles, interval_ms):
     pivots = []
 
-    for index in range(len(candles) - 2):
-        candle = candles[index]
+    if len(candles) < 7:
+        return pivots
 
-        first_after = candles[index + 1]
-        second_after = candles[index + 2]
+    # PIVOT LOW:
+    # First: 3 lower lows.
+    # Then: 3 higher highs.
+    #
+    # PIVOT HIGH:
+    # First: 3 higher highs.
+    # Then: 3 lower lows.
+    #
+    # Events do not need to be consecutive.
+    # Wick and body breaks are both counted.
+    # Each new event must break the last counted level.
 
-        first_high = float(first_after[2])
-        second_high = float(second_after[2])
+    low_count = 0
+    low_reference = float(candles[0][3])
+    low_reference_time = int(candles[0][0])
 
-        first_low = float(first_after[3])
-        second_low = float(second_after[3])
+    low_phase = False
+    low_high_count = 0
+    low_high_reference = None
+    low_pivot_confirmed = False
 
-        confirmed_at = (
-            int(second_after[0]) + interval_ms
-        )
+    high_count = 0
+    high_reference = float(candles[0][2])
+    high_reference_time = int(candles[0][0])
 
-        # PIVOT LOW
-        if second_high > first_high:
-            pivots.append({
-                "type": "LOW",
-                "price": float(candle[3]),
-                "time": int(candle[0]),
-                "confirmed_at": confirmed_at,
-            })
+    high_phase = False
+    high_low_count = 0
+    high_low_reference = None
+    high_pivot_confirmed = False
 
-        # PIVOT HIGH
-        if second_low < first_low:
-            pivots.append({
-                "type": "HIGH",
-                "price": float(candle[2]),
-                "time": int(candle[0]),
-                "confirmed_at": confirmed_at,
-            })
+    for candle in candles[1:]:
+        candle_time = int(candle[0])
+        candle_high = float(candle[2])
+        candle_low = float(candle[3])
+
+        # ------------------------------------------
+        # PIVOT LOW DETECTION
+        # ------------------------------------------
+
+        if not low_phase:
+
+            if candle_low < low_reference:
+                low_count += 1
+                low_reference = candle_low
+                low_reference_time = candle_time
+
+                low_high_reference = candle_high
+
+                if low_count >= 3:
+                    low_phase = True
+                    low_high_count = 0
+                    low_pivot_confirmed = False
+
+        else:
+
+            # A new lower low restarts the first phase.
+            if candle_low < low_reference:
+
+                low_count = 1
+                low_reference = candle_low
+                low_reference_time = candle_time
+
+                low_high_reference = candle_high
+                low_high_count = 0
+                low_pivot_confirmed = False
+
+            elif candle_high > low_high_reference:
+
+                low_high_count += 1
+                low_high_reference = candle_high
+
+                if (
+                    low_high_count >= 3
+                    and not low_pivot_confirmed
+                ):
+                    pivots.append({
+                        "type": "LOW",
+                        "price": low_reference,
+                        "time": low_reference_time,
+                        "confirmed_at": (
+                            candle_time + interval_ms
+                        ),
+                    })
+
+                    low_pivot_confirmed = True
+
+        # ------------------------------------------
+        # PIVOT HIGH DETECTION
+        # ------------------------------------------
+
+        if not high_phase:
+
+            if candle_high > high_reference:
+                high_count += 1
+                high_reference = candle_high
+                high_reference_time = candle_time
+
+                high_low_reference = candle_low
+
+                if high_count >= 3:
+                    high_phase = True
+                    high_low_count = 0
+                    high_pivot_confirmed = False
+
+        else:
+
+            # A new higher high restarts the first phase.
+            if candle_high > high_reference:
+
+                high_count = 1
+                high_reference = candle_high
+                high_reference_time = candle_time
+
+                high_low_reference = candle_low
+                high_low_count = 0
+                high_pivot_confirmed = False
+
+            elif candle_low < high_low_reference:
+
+                high_low_count += 1
+                high_low_reference = candle_low
+
+                if (
+                    high_low_count >= 3
+                    and not high_pivot_confirmed
+                ):
+                    pivots.append({
+                        "type": "HIGH",
+                        "price": high_reference,
+                        "time": high_reference_time,
+                        "confirmed_at": (
+                            candle_time + interval_ms
+                        ),
+                    })
+
+                    high_pivot_confirmed = True
+
+    pivots.sort(
+        key=lambda p: p["confirmed_at"]
+    )
 
     return pivots
 
@@ -440,6 +554,10 @@ def latest_valid_pivot(
     return None
 
 
+# ==================================================
+# SHADOW SAME-CANDLE SWEEP
+# ==================================================
+
 def check_sweep(pivot, candle):
     try:
         high = Decimal(str(candle[2]))
@@ -451,15 +569,17 @@ def check_sweep(pivot, candle):
         return None
 
     # BUY:
-    # The LOW of this exact candle must go below the pivot.
-    # The CLOSE of this exact candle must finish above the pivot.
+    # Wick goes below pivot low.
+    # Same candle closes above pivot low.
+
     if pivot["type"] == "LOW":
         if low < level and close > level:
             return "BUY"
 
     # SELL:
-    # The HIGH of this exact candle must go above the pivot.
-    # The CLOSE of this exact candle must finish below the pivot.
+    # Wick goes above pivot high.
+    # Same candle closes below pivot high.
+
     if pivot["type"] == "HIGH":
         if high > level and close < level:
             return "SELL"
@@ -473,8 +593,6 @@ def make_alert_id(
     pivot,
     sweep_interval
 ):
-    # One alert per exact pivot and sweep timeframe.
-    # The candle time is intentionally NOT included.
     return "|".join([
         symbol,
         interval,
@@ -492,7 +610,6 @@ def was_sent_in_old_format(
     sweep_interval,
     pivot
 ):
-    # Prevent old alerts from being sent again after this update.
     old_prefix = "|".join([
         symbol,
         direction,
@@ -723,7 +840,9 @@ def main():
     print("Starting SHADOW rank 30-300 scanner")
     print("Sweep timeframes: 1h and 4h")
     print("Pivot timeframes: 4h, 1d and 1w")
-    print("Duplicate rule: one alert per pivot per sweep timeframe")
+    print("Pivot rule: 3 breaks then 3 reverse breaks")
+    print("Break rule: wick or body")
+    print("Candles do not need to be consecutive")
     print("Close rule: same sweep candle must close beyond pivot")
 
     state = load_state()
