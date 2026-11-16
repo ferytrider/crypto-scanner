@@ -50,8 +50,6 @@ def wait_toobit():
 
 
 def request_json(url, toobit=False):
-    global last_toobit_request
-
     for attempt in range(MAX_RETRIES):
         if toobit:
             wait_toobit()
@@ -179,7 +177,7 @@ def get_market_ranks():
             continue
 
     if not ranked:
-        raise RuntimeError("No coins found in ranks 50-250")
+        raise RuntimeError("No coins found in ranks 30-300")
 
     print(f"Ranked crypto symbols: {len(ranked)}")
     return ranked
@@ -251,7 +249,6 @@ def get_candles(symbol, interval, limit):
     )
 
     now_ms = int(time.time() * 1000)
-
     start_ms = now_ms - interval_ms * limit
 
     params = urllib.parse.urlencode({
@@ -279,7 +276,6 @@ def get_candles(symbol, interval, limit):
         try:
             open_time = int(row[0])
 
-            # A candle is closed only after its interval ends.
             if open_time + interval_ms <= now_ms:
                 closed.append(row)
 
@@ -310,7 +306,6 @@ def aggregate_candles(hourly, target_ms, required_count):
             key=lambda x: int(x[0])
         )
 
-        # Only use complete higher-timeframe candles.
         if len(group) != required_count:
             continue
 
@@ -434,8 +429,6 @@ def latest_valid_pivot(
         if pivot["confirmed_at"] >= sweep_open_time:
             continue
 
-        # Do not use pivots whose full sweep history
-        # is outside the available hourly data.
         if pivot["confirmed_at"] < oldest_time:
             continue
 
@@ -479,6 +472,7 @@ def make_alert_id(
     symbol,
     direction,
     interval,
+    sweep_interval,
     pivot,
     candle
 ):
@@ -486,6 +480,7 @@ def make_alert_id(
         symbol,
         direction,
         interval,
+        sweep_interval,
         str(pivot["time"]),
         str(int(candle[0])),
     ])
@@ -494,7 +489,6 @@ def make_alert_id(
 def scan_symbol(item):
     symbol = item["symbol"]
 
-    # One hourly request is used for 1h, 4h and 1d.
     hourly = get_candles(
         symbol,
         "1h",
@@ -516,7 +510,6 @@ def scan_symbol(item):
         24
     )
 
-    # Weekly candles are fetched separately.
     weekly = get_candles(
         symbol,
         "1w",
@@ -529,67 +522,75 @@ def scan_symbol(item):
         "1w": weekly,
     }
 
-    recent_sweeps = hourly[-3:]
+    sweep_sets = {
+        "1h": hourly[-3:],
+        "4h": four_hour[-2:],
+    }
+
     alerts = []
 
-    for interval, candles in pivot_sets.items():
+    for sweep_interval, sweep_candles in sweep_sets.items():
 
-        if len(candles) < 10:
-            continue
+        for interval, candles in pivot_sets.items():
 
-        pivots = find_pivots(
-            candles,
-            PIVOT_INTERVALS[interval]
-        )
+            if len(candles) < 10:
+                continue
 
-        if not pivots:
-            continue
+            pivots = find_pivots(
+                candles,
+                PIVOT_INTERVALS[interval]
+            )
 
-        for sweep_candle in recent_sweeps:
-            sweep_time = int(sweep_candle[0])
+            if not pivots:
+                continue
 
-            for pivot_type in ("HIGH", "LOW"):
+            for sweep_candle in sweep_candles:
+                sweep_time = int(sweep_candle[0])
 
-                candidates = [
-                    p for p in pivots
-                    if p["type"] == pivot_type
-                ]
+                for pivot_type in ("HIGH", "LOW"):
 
-                pivot = latest_valid_pivot(
-                    candidates,
-                    hourly,
-                    sweep_time
-                )
+                    candidates = [
+                        p for p in pivots
+                        if p["type"] == pivot_type
+                    ]
 
-                if not pivot:
-                    continue
+                    pivot = latest_valid_pivot(
+                        candidates,
+                        hourly,
+                        sweep_time
+                    )
 
-                direction = check_sweep(
-                    pivot,
-                    sweep_candle
-                )
+                    if not pivot:
+                        continue
 
-                if not direction:
-                    continue
+                    direction = check_sweep(
+                        pivot,
+                        sweep_candle
+                    )
 
-                alert_id = make_alert_id(
-                    symbol,
-                    direction,
-                    interval,
-                    pivot,
-                    sweep_candle
-                )
+                    if not direction:
+                        continue
 
-                alerts.append({
-                    "id": alert_id,
-                    "symbol": symbol,
-                    "rank": item["rank"],
-                    "direction": direction,
-                    "interval": interval,
-                    "level": pivot["price"],
-                    "pivot_time": pivot["time"],
-                    "sweep_time": sweep_time,
-                })
+                    alert_id = make_alert_id(
+                        symbol,
+                        direction,
+                        interval,
+                        sweep_interval,
+                        pivot,
+                        sweep_candle
+                    )
+
+                    alerts.append({
+                        "id": alert_id,
+                        "symbol": symbol,
+                        "rank": item["rank"],
+                        "direction": direction,
+                        "interval": interval,
+                        "sweep_interval": sweep_interval,
+                        "level": pivot["price"],
+                        "pivot_time": pivot["time"],
+                        "sweep_time": sweep_time,
+                    })
 
     return alerts
 
@@ -673,6 +674,7 @@ def format_alert(alert):
         f"ارز: {alert['symbol']}\n"
         f"رتبه بازار: {alert['rank']}\n"
         f"جهت: {direction}\n"
+        f"تایم‌فریم کندل شکار: {alert['sweep_interval']}\n"
         f"تایم‌فریم پیوت: {alert['interval']}\n"
         f"قیمت پیوت: {alert['level']}\n"
         "شرط: شدو از سطح عبور کرده و همان کندل "
@@ -681,7 +683,9 @@ def format_alert(alert):
 
 
 def main():
-    print("Starting SHADOW rank 50-250 scanner")
+    print("Starting SHADOW rank 30-300 scanner")
+    print("Sweep timeframes: 1h and 4h")
+    print("Pivot timeframes: 4h, 1d and 1w")
 
     state = load_state()
     sent_ids = set(state.get("sent", []))
