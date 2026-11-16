@@ -6,6 +6,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 from pathlib import Path
+from decimal import Decimal, InvalidOperation
 
 TOOBIT = "https://api.toobit.com"
 PAPRIKA = "https://api.coinpaprika.com/v1"
@@ -344,7 +345,6 @@ def aggregate_candles(hourly, target_ms, required_count):
 def find_pivots(candles, interval_ms):
     pivots = []
 
-    # Each candidate needs two following closed candles.
     for index in range(len(candles) - 2):
         candle = candles[index]
 
@@ -361,9 +361,7 @@ def find_pivots(candles, interval_ms):
             int(second_after[0]) + interval_ms
         )
 
-        # PIVOT LOW:
-        # After the low candle, the second candle
-        # must make a higher high than the first.
+        # PIVOT LOW
         if second_high > first_high:
             pivots.append({
                 "type": "LOW",
@@ -372,9 +370,7 @@ def find_pivots(candles, interval_ms):
                 "confirmed_at": confirmed_at,
             })
 
-        # PIVOT HIGH:
-        # After the high candle, the second candle
-        # must make a lower low than the first.
+        # PIVOT HIGH
         if second_low < first_low:
             pivots.append({
                 "type": "HIGH",
@@ -445,45 +441,70 @@ def latest_valid_pivot(
 
 
 def check_sweep(pivot, candle):
-    high = float(candle[2])
-    low = float(candle[3])
-    close = float(candle[4])
+    try:
+        high = Decimal(str(candle[2]))
+        low = Decimal(str(candle[3]))
+        close = Decimal(str(candle[4]))
+        level = Decimal(str(pivot["price"]))
 
-    level = pivot["price"]
+    except (InvalidOperation, ValueError, TypeError, IndexError):
+        return None
 
-    if (
-        pivot["type"] == "HIGH"
-        and high > level
-        and close < level
-    ):
-        return "SELL"
+    # BUY:
+    # The LOW of this exact candle must go below the pivot.
+    # The CLOSE of this exact candle must finish above the pivot.
+    if pivot["type"] == "LOW":
+        if low < level and close > level:
+            return "BUY"
 
-    if (
-        pivot["type"] == "LOW"
-        and low < level
-        and close > level
-    ):
-        return "BUY"
+    # SELL:
+    # The HIGH of this exact candle must go above the pivot.
+    # The CLOSE of this exact candle must finish below the pivot.
+    if pivot["type"] == "HIGH":
+        if high > level and close < level:
+            return "SELL"
 
     return None
 
 
 def make_alert_id(
     symbol,
+    interval,
+    pivot,
+    sweep_interval
+):
+    # One alert per exact pivot and sweep timeframe.
+    # The candle time is intentionally NOT included.
+    return "|".join([
+        symbol,
+        interval,
+        pivot["type"],
+        str(pivot["time"]),
+        sweep_interval,
+    ])
+
+
+def was_sent_in_old_format(
+    sent_ids,
+    symbol,
     direction,
     interval,
     sweep_interval,
-    pivot,
-    candle
+    pivot
 ):
-    return "|".join([
+    # Prevent old alerts from being sent again after this update.
+    old_prefix = "|".join([
         symbol,
         direction,
         interval,
         sweep_interval,
         str(pivot["time"]),
-        str(int(candle[0])),
-    ])
+    ]) + "|"
+
+    return any(
+        str(old_id).startswith(old_prefix)
+        for old_id in sent_ids
+    )
 
 
 def scan_symbol(item):
@@ -528,6 +549,7 @@ def scan_symbol(item):
     }
 
     alerts = []
+    found_ids = set()
 
     for sweep_interval, sweep_candles in sweep_sets.items():
 
@@ -573,12 +595,15 @@ def scan_symbol(item):
 
                     alert_id = make_alert_id(
                         symbol,
-                        direction,
                         interval,
-                        sweep_interval,
                         pivot,
-                        sweep_candle
+                        sweep_interval
                     )
+
+                    if alert_id in found_ids:
+                        continue
+
+                    found_ids.add(alert_id)
 
                     alerts.append({
                         "id": alert_id,
@@ -588,8 +613,12 @@ def scan_symbol(item):
                         "interval": interval,
                         "sweep_interval": sweep_interval,
                         "level": pivot["price"],
+                        "pivot_type": pivot["type"],
                         "pivot_time": pivot["time"],
                         "sweep_time": sweep_time,
+                        "sweep_high": float(sweep_candle[2]),
+                        "sweep_low": float(sweep_candle[3]),
+                        "sweep_close": float(sweep_candle[4]),
                     })
 
     return alerts
@@ -669,6 +698,11 @@ def format_alert(alert):
         else "فروش SELL"
     )
 
+    if alert["direction"] == "BUY":
+        sweep_price = alert["sweep_low"]
+    else:
+        sweep_price = alert["sweep_high"]
+
     return (
         "🔔 SHADOW ALERT\n"
         f"ارز: {alert['symbol']}\n"
@@ -676,9 +710,12 @@ def format_alert(alert):
         f"جهت: {direction}\n"
         f"تایم‌فریم کندل شکار: {alert['sweep_interval']}\n"
         f"تایم‌فریم پیوت: {alert['interval']}\n"
+        f"نوع پیوت: {alert['pivot_type']}\n"
         f"قیمت پیوت: {alert['level']}\n"
-        "شرط: شدو از سطح عبور کرده و همان کندل "
-        "در سمت مخالف سطح بسته شده است."
+        f"قیمت شدو: {sweep_price}\n"
+        f"کلوز همان کندل: {alert['sweep_close']}\n"
+        "شرط: شدو از پیوت عبور کرده و همان کندل "
+        "در سمت مخالف پیوت بسته شده است."
     )
 
 
@@ -686,6 +723,8 @@ def main():
     print("Starting SHADOW rank 30-300 scanner")
     print("Sweep timeframes: 1h and 4h")
     print("Pivot timeframes: 4h, 1d and 1w")
+    print("Duplicate rule: one alert per pivot per sweep timeframe")
+    print("Close rule: same sweep candle must close beyond pivot")
 
     state = load_state()
     sent_ids = set(state.get("sent", []))
@@ -722,6 +761,19 @@ def main():
                 alert_id = alert["id"]
 
                 if alert_id in sent_ids:
+                    continue
+
+                if was_sent_in_old_format(
+                    sent_ids,
+                    alert["symbol"],
+                    alert["direction"],
+                    alert["interval"],
+                    alert["sweep_interval"],
+                    {
+                        "time": alert["pivot_time"]
+                    }
+                ):
+                    sent_ids.add(alert_id)
                     continue
 
                 message = format_alert(alert)
