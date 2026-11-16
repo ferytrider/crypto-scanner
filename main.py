@@ -4,8 +4,9 @@ import json
 import time
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib.error
 from pathlib import Path
+from datetime import datetime, timezone
 
 BASE = "https://api.toobit.com"
 STATE_FILE = Path("scan_state.json")
@@ -13,289 +14,202 @@ STATE_FILE = Path("scan_state.json")
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-INTERVAL_MS = {
-    "1h": 60 * 60 * 1000,
+PIVOT_LEFT = 3
+PIVOT_RIGHT = 3
+
+# Higher-timeframe pivots, tested by closed 1h candles
+PIVOT_INTERVALS = {
     "4h": 4 * 60 * 60 * 1000,
     "1d": 24 * 60 * 60 * 1000,
     "1w": 7 * 24 * 60 * 60 * 1000,
 }
+SCAN_INTERVAL = "1h"
+SCAN_MS = 60 * 60 * 1000
 
-# SHADOW settings
-PIVOT_SIDE = 3
-HIGHER_TF_LIMIT = 200
+REQUEST_DELAY = 0.18
+MAX_RETRIES = 5
 
 
 def api_get(path, params=None):
     query = urllib.parse.urlencode(params or {})
     url = BASE + path + ("?" + query if query else "")
-    req = urllib.request.Request(
-        url, headers={"User-Agent": "crypto-scanner/1.0"}
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "ShadowScanner/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=20) as response:
+                return json.loads(response.read().decode())
+
+        except urllib.error.HTTPError as e:
+            if e.code == 429 or e.code >= 500:
+                time.sleep(min(2 ** attempt, 30))
+                continue
+            raise
+
+        except Exception:
+            time.sleep(min(2 ** attempt, 30))
+
+    raise RuntimeError("API request failed: " + path)
+
+
+def load_state():
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except Exception:
+            pass
+    return {"sent": []}
+
+
+def save_state(state):
+    # Keep recent alert IDs only
+    state["sent"] = state["sent"][-10000:]
+    STATE_FILE.write_text(
+        json.dumps(state, ensure_ascii=False)
     )
-    with urllib.request.urlopen(req, timeout=20) as response:
-        return json.loads(response.read().decode("utf-8"))
 
 
-def get_server_time():
-    data = api_get("/api/v1/time")
-    return int(data["serverTime"])
-
-
-def get_symbols():
+def get_contracts():
     data = api_get("/api/v1/exchangeInfo")
+
     contracts = data.get("contracts", [])
 
-    symbols = []
-    for item in contracts:
-        symbol = item.get("symbol", "")
-        inverse = item.get("inverse", False)
-
-        if (
-            item.get("status") == "TRADING"
-            and item.get("quoteAsset") == "USDT"
-            and not inverse
-            and symbol.endswith("-SWAP-USDT")
-        ):
-            symbols.append(symbol)
-
-    return sorted(set(symbols))
+    return [
+        item["symbol"]
+        for item in contracts
+        if item.get("status") == "TRADING"
+        and item.get("symbol", "").endswith("-SWAP-USDT")
+    ]
 
 
-def get_closed_candles(symbol, interval, server_time, limit=40):
-    duration = INTERVAL_MS[interval]
-    start_time = server_time - duration * (limit + 2)
-
+def get_candles(symbol, interval, limit=1000):
     data = api_get(
         "/quote/v1/klines",
         {
             "symbol": symbol,
             "interval": interval,
-            "startTime": start_time,
-            "endTime": server_time,
             "limit": limit,
         }
     )
 
-    if isinstance(data, dict):
-        data = data.get("data", [])
+    if not isinstance(data, list):
+        return []
 
     candles = []
 
     for row in data:
-        if len(row) < 5:
+        if not isinstance(row, list) or len(row) < 6:
             continue
 
-        candle = {
+        candles.append({
             "time": int(row[0]),
             "open": float(row[1]),
             "high": float(row[2]),
             "low": float(row[3]),
             "close": float(row[4]),
-        }
+        })
 
-        if candle["time"] + duration <= server_time:
-            candles.append(candle)
-
-    return sorted(candles, key=lambda x: x["time"])
+    return candles
 
 
-# ==================================
-# STRATEGY 1: SURPRISE
-# Original strategy preserved
-# ==================================
+def closed_candles(candles, interval_ms):
+    now = int(time.time() * 1000)
 
-def candle_direction(c):
-    if c["close"] > c["open"]:
-        return "bull"
-    if c["close"] < c["open"]:
-        return "bear"
-    return "doji"
+    return [
+        c for c in candles
+        if c["time"] + interval_ms <= now
+    ]
 
 
-def body_size(c):
-    return abs(c["close"] - c["open"])
-
-
-def is_powerful(candles, index):
-    c = candles[index]
-    body = body_size(c)
-
-    upper_wick = c["high"] - max(c["open"], c["close"])
-    lower_wick = min(c["open"], c["close"]) - c["low"]
-    wick_sum = max(0, upper_wick) + max(0, lower_wick)
-
-    previous = candles[max(0, index - 10):index]
-    if len(previous) < 10:
-        return False
-
-    average_body = sum(body_size(x) for x in previous) / 10
-
-    return (
-        body > 0
-        and body >= 3 * wick_sum
-        and body >= 2 * average_body
-    )
-
-
-def scan_surprise(candles):
-    if len(candles) < 13:
-        return None
-
-    last_index = len(candles) - 1
-    direction = candle_direction(candles[last_index])
-
-    if direction not in ("bull", "bear"):
-        return None
-
-    start = last_index
-
-    while start >= 0:
-        if (
-            candle_direction(candles[start]) == direction
-            and is_powerful(candles, start)
-        ):
-            start -= 1
-        else:
-            break
-
-    first_impulse = start + 1
-    impulse_count = last_index - first_impulse + 1
-
-    if impulse_count < 2 or start < 0:
-        return None
-
-    opposite = candles[start]
-    expected_opposite = "bear" if direction == "bull" else "bull"
-
-    if candle_direction(opposite) != expected_opposite:
-        return None
-
-    return {
-        "time": candles[last_index]["time"],
-        "direction": direction,
-        "count": impulse_count,
-        "zone_high": opposite["high"],
-        "zone_low": opposite["low"],
-    }
-
-
-# ==================================
-# STRATEGY 2: SHADOW
-# ==================================
-
-def find_pivots(candles, timeframe):
+def find_pivots(candles, interval, interval_ms):
     pivots = []
-    side = PIVOT_SIDE
 
-    if len(candles) < side * 2 + 1:
-        return pivots
+    # A pivot needs 3 candles on both sides.
+    for i in range(
+        PIVOT_LEFT,
+        len(candles) - PIVOT_RIGHT
+    ):
+        current = candles[i]
 
-    duration = INTERVAL_MS[timeframe]
+        before = candles[i - PIVOT_LEFT:i]
+        after = candles[i + 1:i + PIVOT_RIGHT + 1]
 
-    for i in range(side, len(candles) - side):
-        center = candles[i]
+        left_highs = [c["high"] for c in before]
+        right_highs = [c["high"] for c in after]
 
-        left = candles[i - side:i]
-        right = candles[i + 1:i + side + 1]
-        neighbors = left + right
+        left_lows = [c["low"] for c in before]
+        right_lows = [c["low"] for c in after]
 
-        confirmed_at = (
-            candles[i + side]["time"] + duration
-        )
-
-        # Pivot High
-        if all(
-            center["high"] > x["high"]
-            for x in neighbors
+        # Confirmed pivot high
+        if (
+            current["high"] > max(left_highs)
+            and current["high"] > max(right_highs)
         ):
             pivots.append({
-                "type": "high",
-                "price": center["high"],
-                "time": center["time"],
-                "confirmed_at": confirmed_at,
+                "side": "HIGH",
+                "price": current["high"],
+                "time": current["time"],
+                "confirmed_at": (
+                    after[-1]["time"] + interval_ms
+                ),
+                "interval": interval,
             })
 
-        # Pivot Low
-        if all(
-            center["low"] < x["low"]
-            for x in neighbors
+        # Confirmed pivot low
+        if (
+            current["low"] < min(left_lows)
+            and current["low"] < min(right_lows)
         ):
             pivots.append({
-                "type": "low",
-                "price": center["low"],
-                "time": center["time"],
-                "confirmed_at": confirmed_at,
+                "side": "LOW",
+                "price": current["low"],
+                "time": current["time"],
+                "confirmed_at": (
+                    after[-1]["time"] + interval_ms
+                ),
+                "interval": interval,
             })
 
     return pivots
 
 
-def scan_shadow(candles_1h, references):
-    if not candles_1h:
-        return []
+def check_sweep(pivot, candle):
+    level = pivot["price"]
 
-    c = candles_1h[-1]
-    results = []
+    # Price takes liquidity above pivot high,
+    # then the SAME candle closes below it.
+    if pivot["side"] == "HIGH":
+        if (
+            candle["high"] > level
+            and candle["close"] < level
+        ):
+            return "SELL"
 
-    for timeframe, pivots in references.items():
-        for pivot in pivots:
+    # Price takes liquidity below pivot low,
+    # then the SAME candle closes above it.
+    if pivot["side"] == "LOW":
+        if (
+            candle["low"] < level
+            and candle["close"] > level
+        ):
+            return "BUY"
 
-            if c["time"] < pivot["confirmed_at"]:
-                continue
+    return None
 
-            level = pivot["price"]
-
-            # Sweep above pivot high and close below
-            if (
-                pivot["type"] == "high"
-                and c["high"] > level
-                and c["close"] < level
-            ):
-                results.append({
-                    "direction": "SELL",
-                    "timeframe": timeframe,
-                    "level": level,
-                    "pivot_time": pivot["time"],
-                    "pivot_type": "high",
-                    "candle_time": c["time"],
-                })
-
-            # Sweep below pivot low and close above
-            elif (
-                pivot["type"] == "low"
-                and c["low"] < level
-                and c["close"] > level
-            ):
-                results.append({
-                    "direction": "BUY",
-                    "timeframe": timeframe,
-                    "level": level,
-                    "pivot_time": pivot["time"],
-                    "pivot_type": "low",
-                    "candle_time": c["time"],
-                })
-
-    return results
-
-
-def shadow_state_key(symbol, event):
-    return (
-        f"{symbol}|SHADOW|{event['timeframe']}|"
-        f"{event['pivot_type']}|{event['pivot_time']}|"
-        f"{event['level']:.12g}"
-    )
-
-
-# ==================================
-# TELEGRAM
-# ==================================
 
 def send_telegram(message):
     if not TOKEN or not CHAT_ID:
-        raise RuntimeError(
-            "TELEGRAM_TOKEN یا TELEGRAM_CHAT_ID تنظیم نشده است."
-        )
+        print("Telegram credentials missing")
+        return False
 
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    url = (
+        "https://api.telegram.org/bot"
+        + TOKEN
+        + "/sendMessage"
+    )
 
     payload = urllib.parse.urlencode({
         "chat_id": CHAT_ID,
@@ -304,163 +218,144 @@ def send_telegram(message):
 
     req = urllib.request.Request(url, data=payload)
 
-    with urllib.request.urlopen(req, timeout=20) as response:
-        result = json.loads(response.read().decode("utf-8"))
-
-    if not result.get("ok"):
-        raise RuntimeError(f"Telegram error: {result}")
-
-
-# ==================================
-# STATE
-# ==================================
-
-def load_state():
-    if not STATE_FILE.exists():
-        return {}, False
-
     try:
-        return json.loads(STATE_FILE.read_text()), True
-    except Exception:
-        return {}, False
+        with urllib.request.urlopen(req, timeout=20) as response:
+            result = json.loads(response.read().decode())
+            return result.get("ok", False)
+    except Exception as e:
+        print("Telegram error:", e)
+        return False
 
 
-def save_state(state):
-    STATE_FILE.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2)
+def make_alert(symbol, direction, pivot, candle):
+    emoji = "🔴" if direction == "SELL" else "🟢"
+
+    pivot_time = datetime.fromtimestamp(
+        pivot["time"] / 1000,
+        timezone.utc
+    ).strftime("%Y-%m-%d %H:%M UTC")
+
+    candle_time = datetime.fromtimestamp(
+        candle["time"] / 1000,
+        timezone.utc
+    ).strftime("%Y-%m-%d %H:%M UTC")
+
+    return (
+        f"{emoji} SHADOW {direction}\n\n"
+        f"Symbol: {symbol}\n"
+        f"Pivot timeframe: {pivot['interval']}\n"
+        f"Pivot type: {pivot['side']}\n"
+        f"Pivot price: {pivot['price']}\n"
+        f"Pivot time: {pivot_time}\n\n"
+        f"1H sweep candle:\n"
+        f"High: {candle['high']}\n"
+        f"Low: {candle['low']}\n"
+        f"Close: {candle['close']}\n"
+        f"Close time: {candle_time}\n\n"
+        f"Liquidity sweep confirmed."
     )
 
 
-# ==================================
-# SYMBOL SCANNER
-# ==================================
+def scan_symbol(symbol, state, latest_hour):
+    new_alerts = 0
 
-def scan_symbol(symbol, server_time):
-    # SURPRISE: 40 closed 1H candles
-    candles_1h = get_closed_candles(
-        symbol, "1h", server_time, 40
-    )
+    for interval, interval_ms in PIVOT_INTERVALS.items():
+        try:
+            candles = get_candles(symbol, interval, 1000)
+            candles = closed_candles(candles, interval_ms)
 
-    surprise = scan_surprise(candles_1h)
+            pivots = find_pivots(
+                candles, interval, interval_ms
+            )
 
-    # SHADOW: higher timeframe pivot history
-    references = {}
+            time.sleep(REQUEST_DELAY)
 
-    for timeframe in ("4h", "1d", "1w"):
-        candles = get_closed_candles(
-            symbol,
-            timeframe,
-            server_time,
-            HIGHER_TF_LIMIT
-        )
+            for pivot in pivots:
+                # The pivot must be confirmed BEFORE
+                # the 1h sweep candle begins.
+                if pivot["confirmed_at"] > latest_hour["time"]:
+                    continue
 
-        references[timeframe] = find_pivots(
-            candles, timeframe
-        )
+                alert_id = (
+                    symbol + "|" +
+                    interval + "|" +
+                    str(pivot["time"]) + "|" +
+                    pivot["side"] + "|" +
+                    str(latest_hour["time"])
+                )
 
-    shadow = scan_shadow(candles_1h, references)
+                if alert_id in state["sent"]:
+                    continue
 
-    return symbol, surprise, shadow
+                direction = check_sweep(
+                    pivot, latest_hour
+                )
 
+                if not direction:
+                    continue
 
-# ==================================
-# MAIN
-# ==================================
+                message = make_alert(
+                    symbol,
+                    direction,
+                    pivot,
+                    latest_hour
+                )
+
+                print(message)
+
+                if send_telegram(message):
+                    state["sent"].append(alert_id)
+                    new_alerts += 1
+
+        except Exception as e:
+            print("Error:", symbol, interval, str(e))
+
+    return new_alerts
+
 
 def main():
-    server_time = get_server_time()
-    symbols = get_symbols()
+    print("SHADOW SCANNER STARTED")
 
-    print(f"Found {len(symbols)} USDT futures contracts.")
+    state = load_state()
 
-    state, state_exists = load_state()
+    contracts = get_contracts()
+    print("USDT futures contracts:", len(contracts))
 
-    new_messages = []
     checked = 0
     errors = 0
+    alerts = 0
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {
-            executor.submit(
-                scan_symbol, symbol, server_time
-            ): symbol
-            for symbol in symbols
-        }
+    for symbol in contracts:
+        try:
+            candles = get_candles(
+                symbol, SCAN_INTERVAL, 10
+            )
+            candles = closed_candles(candles, SCAN_MS)
 
-        for future in as_completed(futures):
-            symbol = futures[future]
+            if not candles:
+                continue
 
-            try:
-                symbol, surprise, shadow = future.result()
-                checked += 1
+            latest_hour = candles[-1]
 
-                # SURPRISE: original alert logic
-                surprise_key = f"{symbol}|SURPRISE"
+            alerts += scan_symbol(
+                symbol, state, latest_hour
+            )
 
-                if surprise:
-                    event_time = surprise["time"]
-                    old_time = int(state.get(surprise_key, 0))
+            checked += 1
 
-                    if state_exists and event_time > old_time:
-                        direction = (
-                            "صعودی" if surprise["direction"] == "bull"
-                            else "نزولی"
-                        )
+        except Exception as e:
+            errors += 1
+            print("Symbol error:", symbol, str(e))
 
-                        message = (
-                            f"🚨 SURPRISE | {symbol}\n"
-                            f"جهت: {direction}\n"
-                            f"تعداد کندل قدرتمند: {surprise['count']}\n"
-                            f"محدوده کندل مخالف:\n"
-                            f"کف: {surprise['zone_low']}\n"
-                            f"سقف: {surprise['zone_high']}\n"
-                            f"تایم‌فریم: 1H\n"
-                            f"⏳ بررسی برگشت قیمت با خودت"
-                        )
-
-                        new_messages.append(message)
-
-                    state[surprise_key] = max(
-                        old_time, event_time
-                    )
-
-                # SHADOW: one alert per pivot
-                for event in shadow:
-                    key = shadow_state_key(symbol, event)
-
-                    if key in state:
-                        continue
-
-                    message = (
-                        f"🎯 SHADOW | {symbol}\n"
-                        f"جهت: {event['direction']}\n"
-                        f"تایم‌فریم پیوت: {event['timeframe']}\n"
-                        f"قیمت پیوت: {event['level']}\n"
-                        f"نوع پیوت: "
-                        f"{'سقف' if event['direction'] == 'SELL' else 'کف'}\n"
-                        f"تأیید: شکست و برگشت در کندل بسته‌شده 1H"
-                    )
-
-                    if state_exists:
-                        new_messages.append(message)
-
-                    state[key] = event["candle_time"]
-
-            except Exception as error:
-                errors += 1
-                print(f"Error on {symbol}: {error}")
-
-    # Send new alerts
-    for message in new_messages:
-        send_telegram(message)
-        time.sleep(0.2)
+        time.sleep(REQUEST_DELAY)
+        save_state(state)
 
     save_state(state)
 
-    print(
-        f"Finished. Checked: {checked}, "
-        f"Errors: {errors}, New alerts: {len(new_messages)}"
-    )
+    print("\nSHADOW SCAN FINISHED")
+    print("Checked:", checked)
+    print("Errors:", errors)
+    print("New alerts:", alerts)
 
 
 if __name__ == "__main__":
