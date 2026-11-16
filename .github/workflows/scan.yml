@@ -3,7 +3,7 @@ name: Crypto Scanner
 
 on:
   schedule:
-    - cron: "5 * * * *"
+    - cron: "2 * * * *"
   workflow_dispatch:
 
 permissions:
