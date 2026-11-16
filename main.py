@@ -344,41 +344,41 @@ def aggregate_candles(hourly, target_ms, required_count):
 def find_pivots(candles, interval_ms):
     pivots = []
 
-    for index in range(3, len(candles) - 3):
+    # Each candidate needs two following closed candles.
+    for index in range(len(candles) - 2):
         candle = candles[index]
 
-        high = float(candle[2])
-        low = float(candle[3])
+        first_after = candles[index + 1]
+        second_after = candles[index + 2]
 
-        left = candles[index - 3:index]
-        right = candles[index + 1:index + 4]
+        first_high = float(first_after[2])
+        second_high = float(second_after[2])
 
-        is_high = all(
-            high > float(item[2])
-            for item in left + right
-        )
-
-        is_low = all(
-            low < float(item[3])
-            for item in left + right
-        )
+        first_low = float(first_after[3])
+        second_low = float(second_after[3])
 
         confirmed_at = (
-            int(right[-1][0]) + interval_ms
+            int(second_after[0]) + interval_ms
         )
 
-        if is_high:
+        # PIVOT LOW:
+        # After the low candle, the second candle
+        # must make a higher high than the first.
+        if second_high > first_high:
             pivots.append({
-                "type": "HIGH",
-                "price": high,
+                "type": "LOW",
+                "price": float(candle[3]),
                 "time": int(candle[0]),
                 "confirmed_at": confirmed_at,
             })
 
-        if is_low:
+        # PIVOT HIGH:
+        # After the high candle, the second candle
+        # must make a lower low than the first.
+        if second_low < first_low:
             pivots.append({
-                "type": "LOW",
-                "price": low,
+                "type": "HIGH",
+                "price": float(candle[2]),
                 "time": int(candle[0]),
                 "confirmed_at": confirmed_at,
             })
