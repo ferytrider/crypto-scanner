@@ -422,28 +422,50 @@ def save_state(state):
 # TELEGRAM
 # =========================
 
+
 def send_telegram(message):
-    if not TOKEN or not CHAT_ID:
-        raise RuntimeError("Telegram credentials missing")
+    # Telegram
+    if TOKEN and CHAT_ID:
+        url = (
+            "https://api.telegram.org/bot"
+            + TOKEN
+            + "/sendMessage"
+        )
 
-    url = (
-        "https://api.telegram.org/bot"
-        + TOKEN
-        + "/sendMessage"
-    )
+        data = urllib.parse.urlencode({
+            "chat_id": CHAT_ID,
+            "text": message,
+        }).encode("utf-8")
 
-    data = urllib.parse.urlencode({
-        "chat_id": CHAT_ID,
-        "text": message,
-    }).encode("utf-8")
+        req = urllib.request.Request(url, data=data)
 
-    req = urllib.request.Request(url, data=data)
+        with urllib.request.urlopen(req, timeout=25) as response:
+            result = json.loads(response.read().decode("utf-8"))
 
-    with urllib.request.urlopen(req, timeout=25) as response:
-        result = json.loads(response.read().decode("utf-8"))
+        if not result.get("ok"):
+            raise RuntimeError("Telegram rejected message")
 
-    if not result.get("ok"):
-        raise RuntimeError("Telegram rejected message")
+    # Bale
+    if BALE_TOKEN and BALE_CHAT_ID:
+        url = (
+            "https://tapi.bale.ai/bot"
+            + BALE_TOKEN
+            + "/sendMessage"
+        )
+
+        data = urllib.parse.urlencode({
+            "chat_id": BALE_CHAT_ID,
+            "text": message,
+        }).encode("utf-8")
+
+        req = urllib.request.Request(url, data=data)
+
+        with urllib.request.urlopen(req, timeout=25) as response:
+            result = json.loads(response.read().decode("utf-8"))
+
+        if not result.get("ok"):
+            raise RuntimeError("Bale rejected message")
+
 
 
 def format_alert(alert):
