@@ -17,6 +17,10 @@ PAPRIKA = "https://api.coinpaprika.com/v1"
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+BALE_TOKEN = os.getenv("BALE_TOKEN")
+BALE_CHAT_ID = os.getenv("BALE_CHAT_ID")
+
+
 MIN_RANK = 10
 MAX_RANK = 1000
 
