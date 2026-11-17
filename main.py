@@ -16,8 +16,8 @@ STATE_FILE = Path("scan_state.json")
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-MIN_RANK = 30
-MAX_RANK = 500
+MIN_RANK = 10
+MAX_RANK = 1000
 
 REQUEST_GAP = 2.5
 MAX_RETRIES = 2
